@@ -1,0 +1,2257 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>EmojiMetaDungeon</title>
+<style>
+    body { margin: 0; padding: 20px; background: #000; display: flex; flex-direction: column; align-items: center; font-family: monospace; color: #fff; }
+    #game-container { position: relative; width: 640px; height: 480px; border: 4px solid #0f380f; background: #306230; }
+    #tilemap, #sprites { position: absolute; top: 0; left: 0; width: 100%; height: 100%; font-size: 40px; line-height: 40px; }
+    .tile, .sprite { position: absolute; width: 40px; height: 40px; display: flex; align-items: center; justify-content: center; }
+    #hud { margin-top: 20px; font-size: 18px; text-align: center; }
+    #instructions { margin-top: 10px; font-size: 14px; color: #9bbc0f; }
+    #room-info { margin-top: 10px; font-size: 12px; color: #6b8; }
+    #inventory { margin-top: 10px; font-size: 14px; color: #fb7; }
+</style>
+</head>
+<body>
+
+<div id="game-container">
+    <div id="tilemap"></div>
+    <div id="sprites"></div>
+</div>
+
+<div id="hud">
+    ❤️ HP: <span id="hp">3</span> | 💎 Trifles: <span id="trifles">0</span>
+</div>
+<div id="inventory">
+    🎒 Inventory: <span id="items">Empty</span>
+</div>
+<div id="quest-hud" style="margin-top:10px; font-size: 14px; color:#6bf;"></div>
+
+<div id="room-info">
+    📍 Room: <span id="current-room">local://start</span>
+</div>
+<div id="instructions">
+    Arrow keys: move | Space: interact/attack | I: inventory | L: load remote room | H: dump history
+</div>
+
+<script>
+const TILE_SIZE = 40;
+const GRID_W = 16;
+const GRID_H = 12;
+
+let player = { x:7, y:9, hp:3, maxHp:3, trifles:0, facing:'up', inventory:[], weapon:null };
+let currentRoom = null;
+let currentRoomUrl = 'local://start';
+let portalCooldown = false;
+const roomCache = {};
+
+
+// === NEW: Adventure Log ===
+class AdventureLogStream {
+    constructor() {
+        this.history = [];
+    }
+    log(event) {
+        this.history.push({
+            time: Date.now(),
+            room: currentRoomUrl,
+            ...event
+        });
+    }
+    dump() {
+        console.log(JSON.stringify(this.history, null, 2));
+        showMessage("History dumped to console (F12)");
+    }
+}
+let Log = new AdventureLogStream();
+
+document.addEventListener('keydown', e=>{
+    if(e.key.toLowerCase()==='h') Log.dump();
+    else if (e.key.toLowerCase() === 'l') return promptLoadRoom();
+
+});
+
+const QuestDB = {
+    "get_sword": {
+        name: "The First Blade",
+        stages: [
+            { id: "start", objective: "Find someone who knows about a weapon." },
+            { id: "find_sword", objective: "Search the forest for a weapon." },
+            { id: "equip_sword", objective: "Equip the sword you found." },
+            { id: "complete", objective: "You are now armed!" }
+        ]
+    }
+};
+
+
+
+class QuestSystem {
+    constructor() {
+        this.quests = {}; // stores progress
+    }
+
+    start(id) {
+        if (!QuestDB[id]) return console.warn("Unknown quest:", id);
+        if (this.quests[id]) return; // already started
+        updateQuestHUD();
+        this.quests[id] = { stage: 0, completed: false };
+        Log.log({ type:"quest_started", quest:id });
+        showMessage("Quest Started: " + QuestDB[id].name);
+        updateQuestHUD();
+    }
+
+    advance(id) {
+        const q = this.quests[id];
+        if (!q || q.completed) return;
+
+        q.stage++;
+        const questDef = QuestDB[id];
+
+        if (q.stage >= questDef.stages.length - 1) {
+            return this.complete(id);
+        }
+
+        Log.log({ type:"quest_stage", quest:id, stage:q.stage });
+        showMessage("Objective Updated: " + questDef.stages[q.stage].objective);
+        updateQuestHUD();
+    }
+
+    complete(id) {
+        const q = this.quests[id];
+        q.completed = true;
+        Log.log({ type:"quest_completed", quest:id });
+        showMessage("Quest Complete: " + QuestDB[id].name);
+        updateQuestHUD();
+    }
+
+    getObjective(id) {
+        const q = this.quests[id];
+        if (!q) return null;
+        const def = QuestDB[id];
+        return def.stages[q.stage].objective;
+    }
+}
+
+let Quests = new QuestSystem();
+
+function getAdjacentNPC(){
+  const offsets = [{x:0,y:0},{x:0,y:-1},{x:0,y:1},{x:-1,y:0},{x:1,y:0}];
+  return (currentRoom.entities||[]).find(e =>
+    e.type === 'npc' &&
+    offsets.some(o => e.x === player.x + o.x && e.y === player.y + o.y)
+  );
+}
+
+// put this near top-level helpers
+function cloneRoom(obj){
+  if (Array.isArray(obj)) return obj.map(cloneRoom);
+  if (obj && typeof obj === 'object') {
+    const out = {};
+    for (const k in obj) out[k] = cloneRoom(obj[k]);
+    return out;
+  }
+  // primitives and functions are returned as-is
+  return obj;
+}
+
+// === Rooms ===
+const localRooms = {
+    'local://start': {
+        name: 'Starting Forest',
+        tilemap: [
+            '🌳🌳🌳🌳🌳🌳🌳🌳🌳🌳🌳🌳🌳🌳🌳🌳',
+            '🌳🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🌳',
+            '🌳🟩🪨🟩🟩🟩🟩🟩🟩🟩🟩🟩🪨🟩🟩🌳',
+            '🌳🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🌳',
+            '🌳🟩🟩🟩🌊🌊🌊🌊🌊🌊🟩🟩🟩🟩🟩🌳',
+            '🌳🟩🟩🟩🌊🌊🌊🌊🌊🌊🟩🟩🟩🟩🟩🌳',
+            '🌳🟩🟩🟩🌊🌊🌊🌊🌊🌊🟩🟩🟩🟩🟩🌳',
+            '🌳🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🌳',
+            '🌳🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🌳',
+            '🌳🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🌳',
+            '🌳🟩🟩🟩🪨🟩🟩🟩🟩🟩🟩🪨🟩🟩🟩🌳',
+            '🌳🌳🌳🌳🌳🌳🌳🟩🟩🌳🌳🌳🌳🌳🌳🌳'
+        ],
+        entities: [
+            {
+                type:'npc',
+                x:8, y:7,
+                emoji:'🙂',
+                dialog:[
+                    ()=>{ Quests.start("get_sword"); return "Welcome to the forest."; },
+                    ()=>"The cave to the south is dangerous.",
+                    ()=>"A weapon might help you survive."
+                ]
+            },
+            {type:'enemy', x:3, y:3, emoji:'👾', hp:2},
+            {type:'enemy', x:12, y:3, emoji:'🦇', hp:2}
+        ],
+
+        signs:[ {x:6,y:9,emoji:'🪧',text:"Press SPACE to interact or attack."} ],
+        items:[
+            {
+                type:'weapon', x:5,y:2, emoji:'🗡️', name:'Bronze Sword', description:'A simple blade.',
+                onAcquire:`player.weapon=item; player.inventory.push(item); showMessage("You equipped the Bronze Sword."); Quests.advance("get_sword");
+ return true;`,
+                onAttack:`
+                    const enemy=currentRoom.entities.find(e=>e.type==='enemy'&&e.x===tx&&e.y===ty);
+                    if(enemy){
+                        enemy.hp--;
+                        if(enemy.hp<=0){ player.trifles+=5; showMessage("Enemy defeated!"); return "killed"; }
+                        else showMessage("Hit!");
+                    }
+                `
+            }
+        ],
+        portals:[ {x:7,y:11,targetRoom:'local://cave',targetX:7,targetY:1,emoji:'🚪'} ]
+    },
+
+    'local://cave': {
+        name:'Dark Cave',
+        tilemap:[
+            '🪨🪨🪨🪨🪨🪨🪨🪨🪨🪨🪨🪨🪨🪨🪨🪨',
+            '🪨⬛⬛⬛⬛⬛⬛🚪⬛⬛⬛⬛⬛⬛⬛🪨',
+            '🪨⬛⬛⬛⬛⬛⬛⬛⬛⬛⬛⬛⬛⬛⬛🪨',
+            '🪨⬛⬛⬛⬛⬛⬛⬛⬛⬛⬛⬛⬛⬛⬛🪨',
+            '🪨⬛⬛⬛⬛⬛⬛⬛⬛⬛⬛⬛⬛⬛⬛🪨',
+            '🪨⬛⬛⬛⬛⬛⬛⬛⬛⬛⬛⬛⬛⬛⬛🪨',
+            '🪨⬛⬛⬛⬛⬛⬛⬛⬛⬛⬛⬛⬛⬛⬛🪨',
+            '🪨⬛⬛⬛⬛⬛⬛⬛⬛⬛⬛⬛⬛⬛⬛🪨',
+            '🪨⬛⬛⬛⬛⬛⬛⬛⬛⬛⬛⬛⬛⬛⬛🪨',
+            '🪨⬛⬛⬛⬛⬛⬛⬛⬛⬛⬛⬛⬛⬛⬛🪨',
+            '🪨⬛⬛⬛⬛⬛⬛⬛⬛⬛⬛⬛⬛⬛⬛🪨',
+            '🪨🪨🪨🪨🪨🪨🪨🪨🪨🪨🪨🪨🪨🪨🪨🪨'
+        ],
+        entities:[ {type:'enemy', x:8,y:6,emoji:'🐉',hp:5} ],
+        items:[],
+        portals:[ {x:7,y:1,targetRoom:'local://start',targetX:7,targetY:10,emoji:'🚪'} ]
+    }
+};
+
+
+// === Script executor ===
+function executeItemScript(item,scriptName,ctx={}) {
+    const script=item[scriptName]; if(!script)return;
+    const fn=new Function('player','item','currentRoom','showMessage',...Object.keys(ctx),script);
+    return fn(player,item,currentRoom,showMessage,...Object.values(ctx));
+}
+
+function showMessage(text){
+    const hud=document.getElementById('hud');
+    const existing=document.getElementById('message');
+    if(existing)existing.remove();
+    const msg=document.createElement('div');
+    msg.id='message'; msg.style.cssText='color:#ff0;margin-top:10px;';
+    msg.textContent=text; hud.appendChild(msg);
+    setTimeout(()=>msg.remove(),2500);
+}
+
+function showAttackEffect(x,y,emoji='🗡️'){
+    const layer=document.getElementById('sprites');
+    const fx=document.createElement('div');
+    fx.className='sprite'; fx.textContent=emoji;
+    fx.style.left=`${x*TILE_SIZE}px`; fx.style.top=`${y*TILE_SIZE}px`;
+    layer.appendChild(fx); setTimeout(()=>fx.remove(),150);
+}
+
+
+// === Room Load (persistent!) ===
+async function loadRoom(roomUrl) {
+    const roomLabel = document.getElementById('current-room');
+    roomLabel.innerHTML = `<span class="loading">Loading ${roomUrl}...</span>`;
+
+    try {
+        console.log("Attempting to load room:", roomUrl);
+
+        if (roomCache[roomUrl]) {
+            console.log("Loaded from cache:", roomUrl);
+            currentRoom = roomCache[roomUrl];
+        } 
+        else if (roomUrl.startsWith('local://')) {
+          console.log("Loading local room:", roomUrl);
+          // OLD: currentRoom = JSON.parse(JSON.stringify(localRooms[roomUrl]));
+          currentRoom = cloneRoom(localRooms[roomUrl]);   // preserves functions!
+          roomCache[roomUrl] = currentRoom;
+        }
+
+        else {
+            console.log("Fetching remote room:", roomUrl);
+
+            const response = await fetch(roomUrl);
+            console.log("Fetch response:", response);
+
+            if (!response.ok) {
+                throw new Error(`HTTP ${response.status} ${response.statusText}`);
+            }
+
+            const data = await response.json();
+            console.log("Parsed remote room data:", data);
+
+            // Debug JSON shape before applying it
+            if (!data.tilemap) {
+                console.warn("⚠️ Remote room missing tilemap");
+                showMessage("⚠️ Remote room has no tilemap");
+            }
+            if (!data.entities) {
+                console.warn("ℹ️ Remote room has no entities");
+            }
+            if (!data.portals) {
+                console.warn("ℹ️ Remote room has no portals");
+            }
+
+            currentRoom = data;
+            roomCache[roomUrl] = data;
+
+            // Show readable popup summary
+            alert("✅ Room Loaded:\n" +
+                  `Name: ${data.name || "(no name)"}\n` +
+                  `Tiles: ${data.tilemap ? data.tilemap.length + " rows" : "MISSING"}\n` +
+                  `Entities: ${data.entities ? data.entities.length : 0}`);
+        }
+
+        currentRoomUrl = roomUrl;
+        initializeRoom();
+
+    } catch (err) {
+        console.error("ROOM LOAD FAILED:", err);
+        showMessage("⚠️ Failed to load room — see console for details.");
+        roomLabel.textContent = currentRoomUrl;
+    }
+}
+
+
+function promptLoadRoom() {
+    const url = prompt("Enter room URL (.json allowed):");
+    if (url) loadRoom(url);
+}
+
+
+// === Room Init ===
+function initializeRoom(){
+    const map=document.getElementById('tilemap');
+    map.innerHTML='';
+    currentRoom.tilemap.forEach((row,y)=>Array.from(row).forEach((t,x)=>{
+        const d=document.createElement('div'); d.className='tile'; d.textContent=t;
+        d.style.left=`${x*TILE_SIZE}px`; d.style.top=`${y*TILE_SIZE}px`; map.appendChild(d);
+    }));
+    // Give enemies their timers when entering a room
+    if (currentRoom.entities) {
+        currentRoom.entities.forEach(e => {
+            if (e.type === 'enemy') e.moveTimer = e.moveTimer || 0;
+        });
+    }
+
+
+    Log.log({ type:"room_enter", name: currentRoom.name });
+
+    render();
+}
+
+
+// === Movement ===
+function canMoveTo(x,y){
+    if(x<0||x>=GRID_W||y<0||y>=GRID_H)return false;
+    const t=Array.from(currentRoom.tilemap[y])[x];
+    return t==='🟩' || t==='⬛' || t==='🚪';
+}
+
+
+// === Render ===
+function render(){
+    const layer=document.getElementById('sprites');
+    layer.innerHTML='';
+    (currentRoom.signs||[]).forEach(s=>draw(s.x,s.y,s.emoji));
+    (currentRoom.items||[]).forEach(i=>draw(i.x,i.y,i.emoji));
+    (currentRoom.portals||[]).forEach(p=>draw(p.x,p.y,p.emoji||'🌀'));
+    (currentRoom.entities||[]).forEach(e=>draw(e.x,e.y,e.emoji));
+    draw(player.x,player.y,'🧝');
+    document.getElementById('hp').textContent=`${player.hp}/${player.maxHp}`;
+    document.getElementById('trifles').textContent=player.trifles;
+    document.getElementById('items').textContent=
+        player.inventory.length ? player.inventory.map(i=>i.emoji).join(' ') : 'Empty';
+
+    function draw(x,y,emoji){
+        const s=document.createElement('div'); s.className='sprite'; s.textContent=emoji;
+        s.style.left=`${x*TILE_SIZE}px`; s.style.top=`${y*TILE_SIZE}px`; layer.appendChild(s);
+    }
+}
+
+function updateQuestHUD() {
+    const hud = document.getElementById('quest-hud');
+    const active = Object.keys(Quests.quests).filter(id => !Quests.quests[id].completed);
+    if (active.length === 0) {
+        hud.textContent = "No active quests.";
+    } else {
+        hud.innerHTML = active.map(id => {
+            return `📜 ${QuestDB[id].name}: <i>${Quests.getObjective(id)}</i>`;
+        }).join("<br>");
+    }
+}
+
+
+
+// === Input ===
+document.addEventListener('keydown',e=>{
+    let nx=player.x,ny=player.y;
+    if(e.key==='ArrowUp')ny--,player.facing='up';
+    else if(e.key==='ArrowDown')ny++,player.facing='down';
+    else if(e.key==='ArrowLeft')nx--,player.facing='left';
+    else if(e.key==='ArrowRight')nx++,player.facing='right';
+    else if(e.key===' ')return interact();
+    else if(e.key.toLowerCase()==='i')return showInventory();
+    if(canMoveTo(nx,ny))player.x=nx,player.y=ny,checkCollisions(),render();
+});
+
+
+// === Interact ===
+function interact(){
+    const o={up:{x:0,y:-1},down:{x:0,y:1},left:{x:-1,y:0},right:{x:1,y:0}}[player.facing];
+    const tx=player.x+o.x,ty=player.y+o.y;
+
+    const sign=(currentRoom.signs||[]).find(s=>s.x===tx&&s.y===ty);
+    if(sign) return showMessage(sign.text);
+
+        // === NPC interaction: talk from any direction ===
+          // NEW: talk to NPC from any direction
+          const npc = getAdjacentNPC();
+          if (npc){
+            npc.dialogIndex = (npc.dialogIndex || 0);
+            const line = npc.dialog[npc.dialogIndex];
+            const text = (typeof line === "function") ? line() : line;
+            Log.log({ type:"npc_dialog", npc:npc.emoji, line:text });
+            showMessage(text ?? "");
+            npc.dialogIndex = (npc.dialogIndex + 1) % npc.dialog.length;
+            return;
+          }
+
+    const idx=(currentRoom.items||[]).findIndex(i=>i.x===tx&&i.y===ty);
+    if(idx>-1){
+        const item=currentRoom.items[idx];
+
+        Log.log({ type:"item_acquired", emoji:item.emoji, name:item.name });
+
+        const remove=executeItemScript(item,'onAcquire');
+        if(remove)currentRoom.items.splice(idx,1);
+        return render();
+    }
+
+    if(player.weapon){
+        render();
+        showAttackEffect(tx,ty,'🗡️');
+        const result=executeItemScript(player.weapon,'onAttack',{tx,ty});
+        const enemy=(currentRoom.entities||[]).find(e=>e.type==='enemy'&&e.x===tx&&e.y===ty);
+
+        if(result==="killed" && enemy){
+            Log.log({ type:"enemy_defeated", emoji:enemy.emoji, triflesGained:5 });
+            showAttackEffect(tx,ty,'💥');
+        } else if(result && enemy){
+            Log.log({ type:"enemy_hit", target:enemy.emoji });
+        }
+
+        currentRoom.entities=(currentRoom.entities||[]).filter(e=>e.hp>0||e.type!=='enemy');
+        return;
+    }
+}
+
+
+// === Portals ===
+function checkCollisions(){
+    for(const p of (currentRoom.portals||[])){
+        if(p.x===player.x && p.y===player.y && !portalCooldown){
+            portalCooldown=true; setTimeout(()=>portalCooldown=false,300);
+            player.x=p.targetX; player.y=p.targetY; loadRoom(p.targetRoom); return;
+        }
+    }
+}
+
+function updateEnemies() {
+    if (!currentRoom || !currentRoom.entities) return;
+
+    currentRoom.entities.forEach(e => {
+        if (e.type !== 'enemy') return;
+
+        // Increment timer
+        e.moveTimer = (e.moveTimer || 0) + 1;
+
+        // Move every ~30 ticks
+        if (e.moveTimer > 30) {
+            e.moveTimer = 0;
+
+            // 4-direction random walk
+            const dirs = [
+                {x:0,y:-1}, {x:0,y:1},
+                {x:-1,y:0}, {x:1,y:0}
+            ];
+            const d = dirs[Math.floor(Math.random()*dirs.length)];
+            const nx = e.x + d.x, ny = e.y + d.y;
+
+            if (canMoveTo(nx, ny)) {
+                e.x = nx;
+                e.y = ny;
+            }
+        }
+    });
+
+    // Check if an enemy moved into the player
+    checkCollisions();
+    render();
+}
+
+
+
+// === Inventory ===
+function showInventory(){
+    if(!player.inventory.length)return showMessage('Inventory empty.');
+    alert(player.inventory.map(i=>`${i.emoji} ${i.name}: ${i.description}`).join('\n'));
+}
+
+async function runSandboxed(code, context) {
+  const blob = new Blob([`
+    onmessage = e => {
+      const ctx = e.data;
+      let result = {};
+      try {
+        const fn = new Function("ctx", codeString);
+        result = fn(ctx) || {};
+      } catch(err) { result = { error: String(err) }; }
+      parent.postMessage(result, "*");
+    };
+    const codeString = ${JSON.stringify(code)};
+  `], { type: "text/javascript" });
+
+  const iframe = document.createElement("iframe");
+  iframe.sandbox = "allow-scripts";
+  iframe.style.display = "none";
+  document.body.appendChild(iframe);
+
+  return new Promise(resolve => {
+    window.addEventListener("message", function handler(e) {
+      window.removeEventListener("message", handler);
+      iframe.remove();
+      resolve(e.data);
+    });
+    iframe.onload = () => iframe.contentWindow.postMessage(context, "*");
+  });
+}
+
+class LLMContentGeneration {
+  constructor(config = {}) {
+    this.endpoint = config.endpoint || "http://localhost:5000/v1/chat/completions";
+    this.model = config.model || "local-llm";
+    this.temperature = config.temperature ?? 0.7;
+    this.apiKey = config.apiKey || null;
+    this.maxTokens = config.maxTokens || 1024;
+
+    // default engine introspection keys
+    this.defaultIntrospectSections = [
+      "localRooms",
+      "QuestDB",
+      "player",
+      "Quests",
+      "currentRoom",
+      "items",
+      "weapons",
+      "entities"
+    ];
+  }
+
+    async callLLM(prompt, schema = null, systemPrompt = null) {
+    const messages = [];
+    if (systemPrompt) messages.push({ role: "system", content: systemPrompt });
+    messages.push({ role: "user", content: this.composePrompt(prompt, schema) });
+
+    const body = {
+      model: this.model,
+      temperature: this.temperature,
+      max_tokens: this.maxTokens,
+      messages
+    };
+
+    const headers = { "Content-Type": "application/json" };
+    if (this.apiKey) headers["Authorization"] = `Bearer ${this.apiKey}`;
+
+    const res = await fetch(this.endpoint, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(body)
+    });
+
+    if (!res.ok) {
+      const msg = await res.text();
+      throw new Error(`LLM request failed: ${res.status} ${msg}`);
+    }
+
+    const data = await res.json();
+    const content = data.choices?.[0]?.message?.content?.trim();
+    return content;
+  }
+
+  composePrompt(prompt, schema) {
+    if (!schema) return prompt;
+    return `${prompt}\n\nContext JSON:\n${JSON.stringify(schema, null, 2)}`;
+  }
+
+  parseJSON(response) {
+    try {
+      return JSON.parse(response);
+    } catch (e) {
+      console.warn("⚠️ LLM did not return valid JSON:", e);
+      return null;
+    }
+  }
+
+  // ---------- Engine Introspection ----------
+  /**
+   * Reads the current script's source (or selected sections) and returns it
+   * formatted for LLM context.
+   * @param {string[]} sections - names of variables or functions to extract
+   * @param {boolean} fullSource - include the full source file
+   */
+  async introspectEngine(sections = null, fullSource = false) {
+    // sections default to core engine data
+    sections = sections || this.defaultIntrospectSections;
+
+    let scriptContent = "";
+    if (fullSource) {
+      // attempt to fetch the current script file from document
+      const currentScript = document.currentScript?.src;
+      if (!currentScript) return "";
+      try {
+        const res = await fetch(currentScript);
+        if (res.ok) scriptContent = await res.text();
+      } catch (err) {
+        console.warn("Failed to fetch full source:", err);
+      }
+    } else {
+      // extract only named sections from global scope
+      scriptContent = sections.map(name => {
+        try {
+          if (window[name] !== undefined) {
+            return `// === ${name} ===\n` + JSON.stringify(window[name], null, 2);
+          }
+          return `// === ${name} ===\nundefined`;
+        } catch {
+          return `// === ${name} ===\nundefined`;
+        }
+      }).join("\n\n");
+    }
+
+    // wrap with introduction for LLM
+    return `This is the current Emoji Metaverse engine's relevant code and data structures:\n\n${scriptContent}`;
+  }
+
+  // ---------- Content Generation Methods ----------
+  async generateRoom(currentRoom, instruction, context = null) {
+    context = context || await this.introspectEngine();
+    const systemPrompt = "You are an emoji RPG level designer. Use the following engine context to generate a new room in JSON format.";
+    const response = await this.callLLM(instruction, { currentRoom, context }, systemPrompt);
+    return this.parseJSON(response);
+  }
+
+  async generateQuest(questDB, instruction, context = null) {
+    context = context || await this.introspectEngine();
+    const systemPrompt = "You are designing a quest for an emoji RPG. Use the provided engine context. Output JSON with id, name, and stages.";
+    const response = await this.callLLM(instruction, { questDB, context }, systemPrompt);
+    return this.parseJSON(response);
+  }
+
+  async generateNPCDialogue(npc, instruction, context = null) {
+    context = context || await this.introspectEngine();
+    const systemPrompt = "You are generating NPC dialogue for an emoji RPG. Use the engine context. Output JSON array of lines.";
+    const response = await this.callLLM(instruction, { npc, context }, systemPrompt);
+    return this.parseJSON(response);
+  }
+
+  async generateItemScript(item, instruction, context = null) {
+    context = context || await this.introspectEngine();
+    const systemPrompt = "You are writing safe JavaScript snippets for an emoji RPG item (onAcquire, onAttack). Use engine context. Return JSON with 'onAcquire' and 'onAttack' strings.";
+    const response = await this.callLLM(instruction, { item, context }, systemPrompt);
+    return this.parseJSON(response);
+  }
+}
+
+
+class InlineLevelEditor {
+    constructor(game) {
+        this.game = game; // {currentRoom, player, QuestDB, Quests, TILE_SIZE, render}
+        this.active = false;
+        this.selection = null;
+        this.bulkSelection = [];
+        this.dragging = false;
+        this.movingObject = null;
+        this.copyBuffer = null;
+        this.createUI();
+        this.attachEvents();
+        this.refreshLists();
+    }
+
+    createUI() {
+        // Editor overlay
+        this.editorUI = document.createElement('div');
+        Object.assign(this.editorUI.style, {
+            position: 'absolute', top: '0', left: '0', width: '100%', height: '100%',
+            pointerEvents: 'none'
+        });
+        document.body.appendChild(this.editorUI);
+
+        // Sidebar
+        this.sidebar = document.createElement('div');
+        Object.assign(this.sidebar.style, {
+            position: 'absolute', right: '0', top: '0', width: '360px', height: '100%',
+            background: 'rgba(0,0,0,0.85)', color: '#fff', fontFamily: 'monospace',
+            fontSize: '14px', padding: '10px', overflowY: 'auto', pointerEvents: 'auto',
+            display: 'none'
+        });
+        this.editorUI.appendChild(this.sidebar);
+
+        // Sidebar HTML
+        this.sidebar.innerHTML = `
+            <h3>Editor</h3>
+            <div>
+                <label>Mode:</label>
+                <select id="edit-mode">
+                    <option value="tile">Tile</option>
+                    <option value="npc">NPC</option>
+                    <option value="item">Item</option>
+                    <option value="portal">Portal</option>
+                    <option value="quest">Quest</option>
+                    <option value="weapon">Weapon</option>
+                </select>
+            </div>
+            <div>
+                <label>Emoji:</label>
+                <input type="text" id="edit-emoji" maxlength="2" value="🟩" style="width:40px"/>
+            </div>
+            <div>
+                <label>Name:</label>
+                <input type="text" id="edit-name" style="width:100%"/>
+            </div>
+            <div>
+                <label>Dialog / Script / Quest Stages:</label>
+                <textarea id="edit-script" style="width:100%;height:100px"></textarea>
+            </div>
+            <button id="preview-script">Preview Script</button>
+            <button id="save-changes">Apply Changes</button>
+            <button id="save-room">Save Room JSON</button>
+            <button id="copy-object">Copy</button>
+            <button id="paste-object">Paste</button>
+            <hr>
+            <div>
+                <h4>Existing Quests</h4>
+                <div id="quest-list"></div>
+            </div>
+            <div>
+                <h4>Existing Weapons</h4>
+                <div id="weapon-list"></div>
+            </div>
+        `;
+    }
+
+    attachEvents() {
+        document.addEventListener('keydown', e => {
+            if(e.key.toLowerCase()==='e') this.toggle();
+        });
+
+        this.gameLayer = document.getElementById('tilemap');
+
+        // Drag & painting / moving
+        this.gameLayer.addEventListener('mousedown', e => {
+            if(!this.active) return;
+            const pos = this.getTilePosition(e);
+            if(!pos) return;
+            if(e.shiftKey) this.selectForBulk(pos.x,pos.y);
+            else this.startDragObject(pos.x,pos.y);
+            this.dragging = true;
+        });
+
+        this.gameLayer.addEventListener('mousemove', e => {
+            if(this.dragging) this.dragMove(e);
+        });
+
+        document.addEventListener('mouseup', () => { 
+            this.dragging = false; 
+            this.movingObject = null;
+        });
+
+        // Buttons
+        this.sidebar.querySelector('#preview-script').addEventListener('click', ()=>this.previewScript());
+        this.sidebar.querySelector('#save-changes').addEventListener('click', ()=>{
+            this.applyChanges(); 
+            this.refreshLists();
+        });
+        this.sidebar.querySelector('#save-room').addEventListener('click', ()=>this.saveRoom());
+        this.sidebar.querySelector('#copy-object').addEventListener('click', ()=>this.copyObject());
+        this.sidebar.querySelector('#paste-object').addEventListener('click', ()=>this.pasteObject());
+    }
+
+    toggle() {
+        this.active = !this.active;
+        this.editorUI.style.pointerEvents = this.active?'auto':'none';
+        this.sidebar.style.display = this.active?'block':'none';
+        if(this.active) alert('Editor active. Click/drag tiles to paint. Shift+Click for multi-selection.');
+        this.refreshLists();
+    }
+
+    refreshLists() {
+        // Quests
+        const questDiv = this.sidebar.querySelector('#quest-list');
+        questDiv.innerHTML='';
+        for(const id in this.game.QuestDB){
+            const quest = this.game.QuestDB[id];
+            const btn = document.createElement('button');
+            btn.textContent = quest.name;
+            btn.style.display='block'; btn.style.width='100%'; btn.style.marginBottom='2px';
+            btn.onclick = ()=>this.selectQuest(id);
+            questDiv.appendChild(btn);
+        }
+
+        // Weapons
+        const weaponDiv = this.sidebar.querySelector('#weapon-list');
+        weaponDiv.innerHTML='';
+        const weapons = (this.game.player.inventory||[]).filter(i=>i.onAttack||i.onAcquire);
+        weapons.forEach((w,i)=>{
+            const btn = document.createElement('button');
+            btn.textContent = w.name;
+            btn.style.display='block'; btn.style.width='100%'; btn.style.marginBottom='2px';
+            btn.onclick = ()=>this.selectWeapon(i);
+            weaponDiv.appendChild(btn);
+        });
+    }
+
+    getTilePosition(e){
+        const rect = this.gameLayer.getBoundingClientRect();
+        const x = Math.floor((e.clientX - rect.left)/this.game.TILE_SIZE);
+        const y = Math.floor((e.clientY - rect.top)/this.game.TILE_SIZE);
+        if(x<0||y<0||x>=16||y>=12) return null;
+        return {x,y};
+    }
+
+    startDragObject(x,y){
+        const npc = (this.game.currentRoom.entities||[]).find(e=>e.x===x&&e.y===y);
+        const item = (this.game.currentRoom.items||[]).find(i=>i.x===x&&i.y===y);
+        if(npc) this.movingObject=npc;
+        else if(item) this.movingObject=item;
+        else this.setTile(x,y,this.sidebar.querySelector('#edit-emoji').value);
+    }
+
+    dragMove(e){
+        const pos = this.getTilePosition(e);
+        if(!pos) return;
+        if(this.movingObject){
+            this.movingObject.x=pos.x;
+            this.movingObject.y=pos.y;
+        } else if(this.sidebar.querySelector('#edit-mode').value==='tile'){
+            this.setTile(pos.x,pos.y,this.sidebar.querySelector('#edit-emoji').value);
+        }
+        this.game.render();
+    }
+
+    selectForBulk(x,y){
+        const npc = (this.game.currentRoom.entities||[]).find(en=>en.x===x&&en.y===y);
+        const item = (this.game.currentRoom.items||[]).find(it=>it.x===x&&it.y===y);
+        if(npc && !this.bulkSelection.includes(npc)) this.bulkSelection.push(npc);
+        if(item && !this.bulkSelection.includes(item)) this.bulkSelection.push(item);
+    }
+
+    selectObjectAt(x,y){
+        const npc = (this.game.currentRoom.entities||[]).find(e=>e.type==='npc'&&e.x===x&&e.y===y);
+        if(npc) return this.selectObject(npc,'npc');
+        const item = (this.game.currentRoom.items||[]).find(i=>i.x===x&&i.y===y);
+        if(item) return this.selectObject(item,'item');
+        const portal = (this.game.currentRoom.portals||[]).find(p=>p.x===x&&p.y===y);
+        if(portal) return this.selectObject(portal,'portal');
+        const tileEmoji = this.game.currentRoom.tilemap[y][x];
+        this.selectObject({x,y,emoji:tileEmoji},'tile');
+    }
+
+    selectObject(obj,type){
+        this.selection={obj,type};
+        const emojiInput = this.sidebar.querySelector('#edit-emoji');
+        const nameInput = this.sidebar.querySelector('#edit-name');
+        const scriptInput = this.sidebar.querySelector('#edit-script');
+
+        emojiInput.value=obj.emoji||'';
+        nameInput.value=obj.name||'';
+        if(type==='npc') scriptInput.value=(obj.dialog||[]).map(fn=>typeof fn==='function'?fn():'').join('\n');
+        else if(type==='item'||type==='weapon') scriptInput.value=obj.onAcquire||obj.onAttack||'';
+        else if(type==='quest') scriptInput.value=(obj.stages||[]).map(s=>s.objective).join(';');
+        else scriptInput.value='';
+    }
+
+    selectQuest(id){
+        const quest = this.game.QuestDB[id];
+        this.selection={obj:quest,type:'quest',id};
+        this.sidebar.querySelector('#edit-name').value=quest.name;
+        this.sidebar.querySelector('#edit-script').value=(quest.stages||[]).map(s=>s.objective).join(';');
+        alert('Quest selected: '+quest.name);
+    }
+
+    selectWeapon(index){
+        const weapon = this.game.player.inventory[index];
+        this.selection={obj:weapon,type:'weapon',index};
+        this.sidebar.querySelector('#edit-name').value=weapon.name;
+        this.sidebar.querySelector('#edit-emoji').value=weapon.emoji||'⚔️';
+        this.sidebar.querySelector('#edit-script').value=weapon.onAttack||weapon.onAcquire||'';
+        alert('Weapon selected: '+weapon.name);
+    }
+
+    applyChanges(){
+        const emoji = this.sidebar.querySelector('#edit-emoji').value;
+        const name = this.sidebar.querySelector('#edit-name').value;
+        const script = this.sidebar.querySelector('#edit-script').value;
+
+        const applyToObj = (obj,type)=>{
+            obj.emoji = emoji||obj.emoji;
+            if(name) obj.name = name;
+            if(type==='npc') obj.dialog=script.split('\n').map(line=>()=>line);
+            if(type==='item') obj.onAcquire=script;
+            if(type==='weapon') obj.onAttack=script;
+            if(type==='quest'){
+                const stages = script.split(';').map((s,i)=>({id:`stage${i}`,objective:s}));
+                obj.stages=stages;
+                this.game.QuestDB[obj.id]=obj;
+            }
+        };
+
+        if(this.bulkSelection.length) this.bulkSelection.forEach(o=>applyToObj(o,o.type));
+        else if(this.selection) applyToObj(this.selection.obj,this.selection.type);
+
+        this.game.render();
+        this.refreshLists();
+    }
+
+    previewScript(){
+        if(!this.selection) return;
+        const script = this.sidebar.querySelector('#edit-script').value;
+        try{
+            const fn = new Function('player','item','currentRoom','showMessage',script);
+            fn(this.game.player,this.selection.obj,this.game.currentRoom,text=>alert('Preview: '+text));
+        }catch(e){
+            alert('Script Error: '+e.message);
+        }
+    }
+
+    setTile(x,y,emoji){
+        const row=this.game.currentRoom.tilemap[y].split('');
+        row[x]=emoji;
+        this.game.currentRoom.tilemap[y]=row.join('');
+    }
+
+    copyObject(){
+        if(this.selection) this.copyBuffer=JSON.parse(JSON.stringify(this.selection.obj));
+        else alert('Select an object first to copy.');
+    }
+
+    pasteObject(){
+        if(!this.copyBuffer) return alert('No object copied.');
+        const mode=this.copyBuffer.type||'item';
+        const copy=JSON.parse(JSON.stringify(this.copyBuffer));
+        if(mode==='npc') this.game.currentRoom.entities=this.game.currentRoom.entities||[] , this.game.currentRoom.entities.push(copy);
+        else if(mode==='item'||mode==='weapon') this.game.currentRoom.items=this.game.currentRoom.items||[] , this.game.currentRoom.items.push(copy);
+        this.game.render();
+    }
+
+    saveRoom(){
+        const json=JSON.stringify(this.game.currentRoom,null,2);
+        const blob=new Blob([json],{type:'application/json'});
+        const url=URL.createObjectURL(blob);
+        const a=document.createElement('a');
+        a.href=url;
+        a.download=`${this.game.currentRoom.name||'room'}.json`;
+        a.click();
+        URL.revokeObjectURL(url);
+        alert('Room JSON downloaded!');
+    }
+}
+
+class NetcodeDownloader {
+    constructor(config = {}) {
+        this.config = {
+            port: config.port || 3000,
+            corsOrigin: config.corsOrigin || "*",
+            defaultRooms: config.defaultRooms || {},
+        };
+    }
+
+    generateServerCode() {
+        const port = this.config.port;
+        const corsOrigin = this.config.corsOrigin;
+
+        return `
+import express from "express";
+import cors from "cors";
+import { WebSocketServer } from "ws";
+import fs from "fs";
+import path from "path";
+
+const app = express();
+app.use(cors({ origin: "${corsOrigin}" }));
+app.use(express.json());
+
+const rooms = ${JSON.stringify(this.config.defaultRooms, null, 2)};
+const players = {}; // { roomId: { playerId: state } }
+const enemies = {}; // { roomId: { enemyId: state } }
+const items = {};   // { roomId: [{item}] }
+const quests = {};  // { roomId: { playerId: { questId: stage, completed } } }
+
+// Serve room JSON bundles
+app.get("/room/:id", (req, res) => {
+    const roomId = req.params.id;
+    if (rooms[roomId]) return res.json(rooms[roomId]);
+    const filePath = path.join("assets", roomId + ".json");
+    if (fs.existsSync(filePath)) return res.json(JSON.parse(fs.readFileSync(filePath)));
+    return res.status(404).json({ error: "Room not found" });
+});
+
+// List asset bundles
+app.get("/assets", (req, res) => {
+    const files = fs.existsSync("assets") ? fs.readdirSync("assets").filter(f => f.endsWith(".json")) : [];
+    res.json(files);
+});
+
+const server = app.listen(${port}, () => console.log("Server running on port ${port}"));
+const wss = new WebSocketServer({ server });
+
+function broadcast(roomId, msg, excludeId) {
+    const data = JSON.stringify(msg);
+    wss.clients.forEach(ws => {
+        if (ws.readyState === ws.OPEN && ws.roomId === roomId && ws.playerId !== excludeId) {
+            ws.send(data);
+        }
+    });
+}
+
+wss.on("connection", ws => {
+    ws.on("message", msg => {
+        const data = JSON.parse(msg);
+        const { roomId, playerId } = data;
+
+        switch (data.type) {
+            case "join":
+                ws.playerId = playerId;
+                ws.roomId = roomId;
+                if (!players[roomId]) players[roomId] = {};
+                players[roomId][playerId] = data.state || { x:0, y:0, hp:3, trifles:0, inventory: [], weapon: null };
+                if (!quests[roomId]) quests[roomId] = {};
+                if (!quests[roomId][playerId]) quests[roomId][playerId] = {};
+                broadcast(roomId, { type: "player_joined", playerId, state: players[roomId][playerId] }, playerId);
+                ws.send(JSON.stringify({ type: "room_state", players: players[roomId], enemies: enemies[roomId] || {}, items: items[roomId] || [], quests: quests[roomId][playerId] }));
+                break;
+
+            case "move":
+                if (players[roomId] && players[roomId][playerId]) {
+                    players[roomId][playerId].x = data.x;
+                    players[roomId][playerId].y = data.y;
+                    broadcast(roomId, { type: "player_moved", playerId, x: data.x, y: data.y }, playerId);
+                }
+                break;
+
+            case "action":
+                // General actions: attack, item pickup, quest updates
+                if (data.actionType === "attack") {
+                    // Reduce enemy HP
+                    const enemy = (enemies[roomId] || {})[data.enemyId];
+                    if (enemy) {
+                        enemy.hp -= data.damage || 1;
+                        if (enemy.hp <= 0) {
+                            delete enemies[roomId][data.enemyId];
+                        }
+                        broadcast(roomId, { type:"enemy_update", enemyId: data.enemyId, hp: enemy?.hp || 0 });
+                    }
+                }
+                else if (data.actionType === "pickup") {
+                    // Remove item from room
+                    if (items[roomId]) {
+                        items[roomId] = items[roomId].filter(i => i.id !== data.itemId);
+                        broadcast(roomId, { type:"item_removed", itemId: data.itemId });
+                    }
+                }
+                else if (data.actionType === "quest") {
+                    if (!quests[roomId][playerId]) quests[roomId][playerId] = {};
+                    quests[roomId][playerId][data.questId] = data.stage;
+                    broadcast(roomId, { type:"quest_update", playerId, questId: data.questId, stage: data.stage });
+                }
+                broadcast(roomId, { ...data, playerId }, playerId);
+                break;
+
+            case "leave":
+                if (players[roomId] && players[roomId][playerId]) {
+                    delete players[roomId][playerId];
+                    broadcast(roomId, { type: "player_left", playerId });
+                }
+                break;
+
+            default:
+                console.warn("Unknown message type:", data.type);
+        }
+    });
+
+    ws.on("close", () => {
+        const { roomId, playerId } = ws;
+        if (roomId && playerId && players[roomId]) {
+            delete players[roomId][playerId];
+            broadcast(roomId, { type: "player_left", playerId });
+        }
+    });
+});
+`;
+    }
+
+    downloadServer(filename = "emoji-multiplayer-server.js") {
+        const code = this.generateServerCode();
+        const blob = new Blob([code], { type: "text/javascript" });
+        const url = URL.createObjectURL(blob);
+
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = filename;
+        a.click();
+        URL.revokeObjectURL(url);
+
+        alert(`Server downloaded! Run with: node ${filename}`);
+    }
+}
+
+class NetcodeServerIntegration {
+    constructor(gameInstance, options = {}) {
+        this.game = gameInstance;
+        this.serverUrl = options.serverUrl || "ws://localhost:3000";
+        this.playerId = options.playerId || `player_${Date.now()}`;
+        this.socket = null;
+        this.players = {};   // other players
+        this.enemies = {};   // enemies synced from server
+        this.items = [];     // room items
+        this.quests = {};    // player quests
+    }
+
+    connect() {
+        this.socket = new WebSocket(this.serverUrl);
+        this.socket.onopen = () => {
+            console.log("Connected to server");
+            this.send({ type: "join", playerId: this.playerId, roomId: this.game.currentRoomUrl, state: this._getPlayerState() });
+        };
+        this.socket.onmessage = (e) => this._handleMessage(JSON.parse(e.data));
+    }
+
+    send(msg) {
+        if (!this.socket || this.socket.readyState !== WebSocket.OPEN) return;
+        this.socket.send(JSON.stringify(msg));
+    }
+
+    _getPlayerState() {
+        return {
+            x: this.game.player.x,
+            y: this.game.player.y,
+            hp: this.game.player.hp,
+            trifles: this.game.player.trifles,
+            inventory: this.game.player.inventory.map(i => i.emoji),
+            weapon: this.game.player.weapon?.emoji || null
+        };
+    }
+
+    _handleMessage(msg) {
+        switch(msg.type) {
+            case "room_state":
+                this.players = { ...msg.players };
+                this.enemies = { ...msg.enemies };
+                this.items = [...msg.items];
+                this.quests = { ...msg.quests };
+                break;
+
+            case "player_joined": this.players[msg.playerId] = msg.state; break;
+            case "player_moved": if (this.players[msg.playerId]) { this.players[msg.playerId].x = msg.x; this.players[msg.playerId].y = msg.y; } break;
+            case "player_left": delete this.players[msg.playerId]; break;
+
+            case "enemy_update":
+                if (msg.hp <= 0) delete this.enemies[msg.enemyId];
+                else this.enemies[msg.enemyId] = { ...this.enemies[msg.enemyId], hp: msg.hp };
+                break;
+
+            case "item_removed":
+                this.items = this.items.filter(i => i.id !== msg.itemId);
+                break;
+
+            case "quest_update":
+                if (!this.quests[msg.playerId]) this.quests[msg.playerId] = {};
+                this.quests[msg.playerId][msg.questId] = msg.stage;
+                break;
+
+            case "action":
+                // Optional: play attack animations or effects
+                break;
+
+            default:
+                console.warn("Unknown server message:", msg);
+        }
+
+        this.renderAll();
+    }
+
+    sendMove() {
+        this.send({ type: "move", playerId: this.playerId, roomId: this.game.currentRoomUrl, x: this.game.player.x, y: this.game.player.y });
+    }
+
+    sendAction(actionType, payload = {}) {
+        this.send({ type: "action", actionType, ...payload, roomId: this.game.currentRoomUrl });
+    }
+
+    renderAll() {
+        const layer = document.getElementById('sprites');
+
+        // Remove previous network players
+        Object.keys(this.players).forEach(id => {
+            let div = document.getElementById(`net-${id}`);
+            if (!div) {
+                div = document.createElement('div');
+                div.id = `net-${id}`;
+                div.className = 'sprite';
+                div.textContent = '🧙';
+                layer.appendChild(div);
+            }
+            div.style.left = `${this.players[id].x * 40}px`;
+            div.style.top = `${this.players[id].y * 40}px`;
+        });
+
+        // Render enemies
+        Object.entries(this.enemies).forEach(([id, enemy]) => {
+            let div = document.getElementById(`enemy-${id}`);
+            if (!div) {
+                div = document.createElement('div');
+                div.id = `enemy-${id}`;
+                div.className = 'sprite';
+                div.textContent = enemy.emoji || '👾';
+                layer.appendChild(div);
+            }
+            div.style.left = `${enemy.x * 40}px`;
+            div.style.top = `${enemy.y * 40}px`;
+        });
+
+        // Render items
+        this.items.forEach(item => {
+            let div = document.getElementById(`item-${item.id}`);
+            if (!div) {
+                div = document.createElement('div');
+                div.id = `item-${item.id}`;
+                div.className = 'sprite';
+                div.textContent = item.emoji;
+                layer.appendChild(div);
+            }
+            div.style.left = `${item.x * 40}px`;
+            div.style.top = `${item.y * 40}px`;
+        });
+    }
+}
+
+
+class AssetServerDownloader {
+    /**
+     * @param {Object} config
+     * @param {number} config.port - The port the server will listen on (default 4000)
+     * @param {string} config.corsOrigin - The CORS origin (default '*')
+     * @param {string} config.assetFolder - Folder where JSON assets are stored (default 'assets')
+     */
+    constructor(config = {}) {
+        this.config = {
+            port: config.port || 4000,
+            corsOrigin: config.corsOrigin || "*",
+            assetFolder: config.assetFolder || "assets"
+        };
+    }
+
+    generateServerCode() {
+        const { port, corsOrigin, assetFolder } = this.config;
+
+        return `
+import express from "express";
+import cors from "cors";
+import fs from "fs";
+import path from "path";
+
+const app = express();
+app.use(cors({ origin: "${corsOrigin}" }));
+app.use(express.json());
+
+const ASSET_FOLDER = "${assetFolder}";
+
+// Ensure asset folder exists
+if (!fs.existsSync(ASSET_FOLDER)) fs.mkdirSync(ASSET_FOLDER);
+
+// Endpoint: list all asset bundles
+app.get("/assets", (req, res) => {
+    const files = fs.readdirSync(ASSET_FOLDER).filter(f => f.endsWith(".json"));
+    res.json(files);
+});
+
+// Endpoint: serve a specific asset bundle
+app.get("/assets/:filename", (req, res) => {
+    const filePath = path.join(ASSET_FOLDER, req.params.filename);
+    if (!fs.existsSync(filePath)) return res.status(404).json({ error: "Asset not found" });
+    const data = JSON.parse(fs.readFileSync(filePath));
+    res.json(data);
+});
+
+// Optional: upload new asset bundles (secure: can be removed if not needed)
+app.post("/assets/:filename", (req, res) => {
+    const filePath = path.join(ASSET_FOLDER, req.params.filename);
+    fs.writeFileSync(filePath, JSON.stringify(req.body, null, 2));
+    res.json({ success: true, filename: req.params.filename });
+});
+
+app.listen(${port}, () => {
+    console.log("Asset server running on port ${port}");
+    console.log("Serving assets from folder:", ASSET_FOLDER);
+});
+`;
+    }
+
+    /**
+     * Download the generated server code as a file
+     * @param {string} filename 
+     */
+    downloadServer(filename = "asset-server.js") {
+        const code = this.generateServerCode();
+        const blob = new Blob([code], { type: "text/javascript" });
+        const url = URL.createObjectURL(blob);
+
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = filename;
+        a.click();
+        URL.revokeObjectURL(url);
+
+        alert(`Asset server downloaded! Run with: node ${filename}`);
+    }
+}
+
+class ReinforcementLearningPlayground {
+  constructor(config={}) {
+    this.config = Object.assign({
+      render: true,
+      observationMode: "symbolic",
+      rewardHooks: {},
+      debug: false,
+      speculative: false,  // allow steps without rendering
+      maxSteps: 1000,      // optional automatic termination
+    }, config);
+
+    this.currentRoom = null;
+    this.player = null;
+    this.done = false;
+    this.reward = 0;
+    this.trajectory = [];
+
+    this.actionMap = {0:'up',1:'down',2:'left',3:'right',4:'interact',5:'attack'};
+    this.stepCount = 0;
+  }
+
+  // --- Gym-style interface ---
+  reset(startRoom='local://start') {
+    loadRoom(startRoom);
+    this.currentRoom = cloneRoom(currentRoom);
+    this.player = {...player};
+    this.done = false;
+    this.reward = 0;
+    this.trajectory = [];
+    this.stepCount = 0;
+    return this.getObservation();
+  }
+
+  // --- Step through the environment ---
+  step(actionId) {
+    if (this.done) return {obs:this.getObservation(), reward:0, done:true, info:{}};
+    this.stepCount++;
+
+    const action = this.actionMap[actionId];
+    let rewardDelta = 0;
+
+    if (["up","down","left","right"].includes(action)) {
+      const [nx, ny] = this.getNextPos(action);
+      if (canMoveTo(nx, ny)) {
+        player.x = nx;
+        player.y = ny;
+        checkCollisions();
+      }
+    } else if (action === "interact") {
+      rewardDelta += this.handleInteraction();
+    } else if (action === "attack") {
+      rewardDelta += this.handleAttack();
+    }
+
+    if (!this.config.speculative) {
+      updateEnemies();
+      if (this.config.render) render();
+    } else {
+      // speculative: run enemies deterministically without render
+      this.updateEnemiesSpeculative();
+    }
+
+    rewardDelta += this.computeReward();
+    this.reward = rewardDelta;
+    this.done = player.hp <= 0 || this.stepCount >= this.config.maxSteps;
+
+    const obs = this.getObservation();
+    this.trajectory.push({obs, action, reward: rewardDelta, done:this.done});
+
+    return {obs, reward: rewardDelta, done:this.done, info:{}};
+  }
+
+  // --- Headless enemy updates ---
+  updateEnemiesSpeculative() {
+    if (!this.currentRoom?.entities) return;
+    this.currentRoom.entities.forEach(e => {
+      if (e.type !== 'enemy') return;
+      e.moveTimer = (e.moveTimer || 0) + 1;
+      if (e.moveTimer > 30) {
+        e.moveTimer = 0;
+        const dirs = [{x:0,y:-1},{x:0,y:1},{x:-1,y:0},{x:1,y:0}];
+        const d = dirs[Math.floor(Math.random()*dirs.length)];
+        const nx = e.x + d.x, ny = e.y + d.y;
+        if (canMoveTo(nx, ny)) { e.x = nx; e.y = ny; }
+      }
+    });
+    checkCollisions();
+  }
+
+  // --- Policy hook for automation ---
+  async runPolicy(policyFn, maxSteps=1000) {
+    this.reset();
+    let done = false;
+    let stepCount = 0;
+
+    while (!done && stepCount < maxSteps) {
+      const obs = this.getObservation();
+      const action = await policyFn(obs); // policy returns action index 0-5
+      const {obs:newObs, reward, done:stepDone} = this.step(action);
+      stepCount++;
+      done = stepDone;
+    }
+    return this.trajectory;
+  }
+
+  // --- Observation helpers ---
+  getObservation() {
+    if (this.config.observationMode === "tilemap") return cloneRoom(this.currentRoom.tilemap);
+    if (this.config.observationMode === "symbolic") return this.extractEntities();
+    if (this.config.observationMode === "feature") return this.extractFeatures();
+    return {};
+  }
+
+  extractEntities() {
+    return {
+      player: {...player},
+      entities: (currentRoom.entities||[]).map(e => ({x:e.x,y:e.y,type:e.type,hp:e.hp}))
+    };
+  }
+
+  extractFeatures() {
+    const nearestEnemy = (currentRoom.entities||[]).filter(e=>e.type==='enemy')
+      .map(e=>Math.abs(e.x-player.x)+Math.abs(e.y-player.y))
+      .sort((a,b)=>a-b)[0] || 0;
+    return [player.hp, player.trifles, nearestEnemy];
+  }
+
+  getNextPos(direction) {
+    let nx = player.x, ny = player.y;
+    if (direction==='up') ny--; else if (direction==='down') ny++;
+    else if (direction==='left') nx--; else if (direction==='right') nx++;
+    return [nx, ny];
+  }
+
+  handleInteraction() {
+    let reward = 0;
+    const npc = getAdjacentNPC();
+    if (npc) reward += this.config.rewardHooks.npcTalk || 0;
+
+    const idx = (currentRoom.items||[]).findIndex(i=>i.x===player.x && i.y===player.y);
+    if (idx>-1) reward += this.config.rewardHooks.itemCollected || 0;
+
+    return reward;
+  }
+
+  handleAttack() {
+    const beforeTrifles = player.trifles;
+    if (player.weapon) interact(); // triggers onAttack
+    return player.trifles - beforeTrifles;
+  }
+
+  computeReward() {
+    let r = 0;
+    if (player.hp <= 0) r += this.config.rewardHooks.death || 0;
+    // optionally include quest completion, enemies killed, etc.
+    return r;
+  }
+
+  render() {
+    if (this.config.render) render();
+  }
+
+  close() {
+    // cleanup timers, optional in headless
+  }
+}
+
+class Interactor {
+    constructor(name, emoji, x, y, onActivate) {
+        this.name = name;
+        this.emoji = emoji;
+        this.x = x;
+        this.y = y;
+        this.active = false;
+        this.onActivate = onActivate; // function(player, currentRoom, this)
+    }
+
+    interact(player, room) {
+        if (this.onActivate) {
+            const result = this.onActivate(player, room, this);
+            this.active = true; // mark as permanently activated
+            if (result) showMessage(result);
+        }
+    }
+}
+
+class PuzzleAssemblage {
+    constructor(name, steps = [], onComplete) {
+        this.name = name;
+        this.steps = steps; // array of functions returning true/false
+        this.currentStep = 0;
+        this.completed = false;
+        this.onComplete = onComplete;
+        this.worldState = {
+            rooms: {},        // roomId => room snapshot
+            items: {},        // itemId => acquired/position/state
+            npcs: {},         // npcId => dialog progress / active
+            interactors: {}   // interactorId => activated state
+        };
+    }
+
+    saveWorldState(room) {
+        // Track a snapshot of relevant room data
+        const roomId = room.name || 'unknown';
+        this.worldState.rooms[roomId] = cloneRoom(room.tilemap);
+        this.worldState.items[roomId] = (room.items||[]).map(i => ({emoji:i.emoji,x:i.x,y:i.y}));
+        this.worldState.npcs[roomId] = (room.entities||[]).filter(e=>e.type==='npc').map(e=>({
+            emoji:e.emoji, dialogIndex:e.dialogIndex||0, x:e.x, y:e.y
+        }));
+        this.worldState.interactors[roomId] = (room.interactors||[]).map(i=>({name:i.name, active:i.active, x:i.x, y:i.y}));
+    }
+
+    attempt(player, room) {
+        if (this.completed) return showMessage(`Puzzle "${this.name}" already solved.`);
+        const stepFn = this.steps[this.currentStep];
+        const success = stepFn(player, room, this.worldState);
+        if (success) {
+            this.currentStep++;
+            this.saveWorldState(room);
+            showMessage(`Puzzle "${this.name}": Step ${this.currentStep} complete!`);
+        } else {
+            showMessage(`Puzzle "${this.name}": Step ${this.currentStep + 1} failed.`);
+        }
+
+        if (this.currentStep >= this.steps.length) {
+            this.completed = true;
+            if (this.onComplete) this.onComplete(player, room, this.worldState);
+            showMessage(`Puzzle "${this.name}" solved!`);
+        }
+    }
+}
+
+class DynamicRoom {
+    constructor(roomData, tileSize = 40, containerId = "game-container") {
+        this.data = roomData;
+        this.tileSize = tileSize;
+        this.containerId = containerId;
+
+        this.refreshDimensions();
+        this.applyCSSSize();
+    }
+
+    // -----------------------------------------------------
+    // Dimension / Structure Handling
+    // -----------------------------------------------------
+    refreshDimensions() {
+        if (!this.data.tilemap || this.data.tilemap.length === 0) {
+            throw new Error("Room has no tilemap.");
+        }
+
+        this.height = this.data.tilemap.length;
+        this.width = Math.max(...this.data.tilemap.map(r => r.length));
+    }
+
+    isInside(x, y) {
+        if (y < 0 || y >= this.height) return false;
+        const rowWidth = this.data.tilemap[y]?.length ?? 0;
+        return x >= 0 && x < rowWidth;
+    }
+
+    // -----------------------------------------------------
+    // Tile Access
+    // -----------------------------------------------------
+    getTile(x, y) {
+        if (!this.isInside(x, y)) return null;
+        return this.data.tilemap[y][x];
+    }
+
+    setTile(x, y, val) {
+        if (!this.isInside(x, y)) return;
+
+        const row = this.data.tilemap[y];
+        const chars = row.split("");
+        chars[x] = val;
+        this.data.tilemap[y] = chars.join("");
+    }
+
+    // -----------------------------------------------------
+    // Map Replacement
+    // -----------------------------------------------------
+    replaceMap(newTilemap) {
+        this.data.tilemap = newTilemap;
+        this.refreshDimensions();
+        this.applyCSSSize();
+    }
+
+    // -----------------------------------------------------
+    // Patch Overlay
+    // -----------------------------------------------------
+    overlayPatch(ox, oy, patch) {
+        for (let y = 0; y < patch.length; y++) {
+            const row = patch[y];
+            for (let x = 0; x < row.length; x++) {
+                const c = row[x];
+                if (c !== " " && c !== null && c !== undefined) {
+                    if (this.isInside(ox + x, oy + y)) {
+                        this.setTile(ox + x, oy + y, c);
+                    }
+                }
+            }
+        }
+        this.refreshDimensions();
+        this.applyCSSSize();
+    }
+
+    // -----------------------------------------------------
+    // Room Resizing (Uniform / Jagged)
+    // -----------------------------------------------------
+    expandWidth(amount = 1, fillChar = " ") {
+        for (let y = 0; y < this.height; y++) {
+            this.data.tilemap[y] += fillChar.repeat(amount);
+        }
+        this.refreshDimensions();
+        this.applyCSSSize();
+    }
+
+    expandHeight(amount = 1, fillChar = " ") {
+        const row = fillChar.repeat(this.width);
+        for (let i = 0; i < amount; i++) {
+            this.data.tilemap.push(row);
+        }
+        this.refreshDimensions();
+        this.applyCSSSize();
+    }
+
+    shrinkWidth(amount = 1) {
+        for (let y = 0; y < this.height; y++) {
+            const row = this.data.tilemap[y];
+            this.data.tilemap[y] = row.slice(0, Math.max(0, row.length - amount));
+        }
+        this.refreshDimensions();
+        this.applyCSSSize();
+    }
+
+    shrinkHeight(amount = 1) {
+        this.data.tilemap.splice(-amount, amount);
+        this.refreshDimensions();
+        this.applyCSSSize();
+    }
+
+    // -----------------------------------------------------
+    // Jagged → Rectangle Normalization
+    // -----------------------------------------------------
+    squarify(fillChar = " ") {
+        const maxWidth = Math.max(...this.data.tilemap.map(r => r.length));
+        for (let y = 0; y < this.height; y++) {
+            const row = this.data.tilemap[y];
+            if (row.length < maxWidth) {
+                this.data.tilemap[y] = row + fillChar.repeat(maxWidth - row.length);
+            }
+        }
+        this.refreshDimensions();
+        this.applyCSSSize();
+    }
+
+    // -----------------------------------------------------
+    // Border Building (Palisades)
+    // -----------------------------------------------------
+    addPalisade(borderChar = "#") {
+        const top = borderChar.repeat(this.width);
+        const bottom = borderChar.repeat(this.width);
+
+        // wrap each row
+        for (let y = 0; y < this.height; y++) {
+            this.data.tilemap[y] = borderChar + this.data.tilemap[y] + borderChar;
+        }
+
+        // add top and bottom
+        this.data.tilemap.unshift(top);
+        this.data.tilemap.push(bottom);
+
+        this.refreshDimensions();
+        this.applyCSSSize();
+    }
+
+    // -----------------------------------------------------
+    // Exterior Layers (Rings of Terrain)
+    // -----------------------------------------------------
+    addExteriorLayers(layers) {
+        for (const layer of layers) {
+            const fill = layer.fill;
+            const size = layer.size;
+
+            for (let s = 0; s < size; s++) {
+                // expand left/right
+                for (let y = 0; y < this.data.tilemap.length; y++) {
+                    this.data.tilemap[y] = fill + this.data.tilemap[y] + fill;
+                }
+
+                // expand top/bottom
+                const width = this.data.tilemap[0].length;
+                const row = fill.repeat(width);
+                this.data.tilemap.unshift(row);
+                this.data.tilemap.push(row);
+            }
+        }
+        this.refreshDimensions();
+        this.applyCSSSize();
+    }
+
+    // -----------------------------------------------------
+    // Rendering Boundaries
+    // -----------------------------------------------------
+    applyCSSSize() {
+        const container = document.getElementById(this.containerId);
+        if (!container) return;
+
+        container.style.width = (this.width * this.tileSize) + "px";
+        container.style.height = (this.height * this.tileSize) + "px";
+    }
+
+    // -----------------------------------------------------
+    // Clone
+    // -----------------------------------------------------
+    clone() {
+        return new DynamicRoom(JSON.parse(JSON.stringify(this.data)),
+                               this.tileSize,
+                               this.containerId);
+    }
+}
+
+class ClassicalProcGen {
+
+    // -------------------------------------------------------------
+    // 1) PERLIN NOISE GENERATOR (classic improved Perlin)
+    // -------------------------------------------------------------
+    static perlinNoise(width, height, options = {}) {
+        const scale = options.scale || 20;
+        const octaves = options.octaves || 1;
+        const persistence = options.persistence || 0.5;
+        const lacunarity = options.lacunarity || 2;
+        const seed = options.seed || Math.random() * 999999;
+
+        const p = ClassicalProcGen.buildPermutationTable(seed);
+
+        const noise2D = (x, y) => {
+            const X = Math.floor(x) & 255;
+            const Y = Math.floor(y) & 255;
+
+            x = x - Math.floor(x);
+            y = y - Math.floor(y);
+
+            const fade = ClassicalProcGen.fade;
+            const lerp = ClassicalProcGen.lerp;
+            const grad = ClassicalProcGen.grad;
+
+            const u = fade(x);
+            const v = fade(y);
+
+            const A  = p[X] + Y;
+            const B  = p[X+1] + Y;
+
+            return lerp(v,
+                lerp(u, grad(p[A],   x, y), grad(p[B],   x-1, y)),
+                lerp(u, grad(p[A+1], x, y-1), grad(p[B+1], x-1, y-1))
+            );
+        };
+
+        const grid = [];
+
+        for (let y = 0; y < height; y++) {
+            const row = [];
+            for (let x = 0; x < width; x++) {
+                let value = 0;
+                let amp = 1;
+                let freq = 1;
+
+                for (let o = 0; o < octaves; o++) {
+                    value += noise2D(x / scale * freq, y / scale * freq) * amp;
+                    amp *= persistence;
+                    freq *= lacunarity;
+                }
+
+                value = (value + 1) / 2; // normalize to [0,1]
+                row.push(value);
+            }
+            grid.push(row);
+        }
+        return grid;
+    }
+
+    static fade(t) { return t * t * t * (t * (t * 6 - 15) + 10); }
+    static lerp(t, a, b) { return a + t * (b - a); }
+    static grad(hash, x, y) {
+        const h = hash & 3;
+        const u = h < 2 ? x : y;
+        const v = h < 2 ? y : x;
+        return ((h & 1) === 0 ? u : -u) + ((h & 2) === 0 ? v : -v);
+    }
+
+    static buildPermutationTable(seed) {
+        const p = new Uint8Array(512);
+        const perm = new Uint8Array(256);
+        
+        let s = seed;
+        for (let i = 0; i < 256; i++) {
+            s = (s * 16807) % 2147483647;
+            perm[i] = s & 255;
+        }
+
+        for (let i = 0; i < 512; i++) p[i] = perm[i & 255];
+        return p;
+    }
+
+    // -------------------------------------------------------------
+    // 2) WAVE FUNCTION COLLAPSE (TIDY MINI-WFC)
+    // -------------------------------------------------------------
+    static waveFunctionCollapse(sample, outW, outH) {
+
+        // sample = 2D array of emoji or chars
+        const H = sample.length;
+        const W = sample[0].length;
+
+        // extract adjacency rules
+        const rules = ClassicalProcGen.buildWFCRules(sample);
+
+        // initialize output grid with superpositions
+        const allTiles = [...new Set(sample.flat())];
+        const grid = Array.from({ length: outH }, () =>
+            Array.from({ length: outW }, () => new Set(allTiles))
+        );
+
+        function lowestEntropyCell() {
+            let best = null, bestCount = 99999;
+            for (let y = 0; y < outH; y++) {
+                for (let x = 0; x < outW; x++) {
+                    const states = grid[y][x];
+                    if (states.size > 1 && states.size < bestCount) {
+                        best = { x, y };
+                        bestCount = states.size;
+                    }
+                }
+            }
+            return best;
+        }
+
+        function observe(x, y) {
+            const states = [...grid[y][x]];
+            const choice = states[Math.floor(Math.random() * states.length)];
+            grid[y][x] = new Set([choice]);
+            return choice;
+        }
+
+        function propagate() {
+            let changed = true;
+            while (changed) {
+                changed = false;
+                for (let y = 0; y < outH; y++) {
+                    for (let x = 0; x < outW; x++) {
+                        const cell = grid[y][x];
+                        if (cell.size === 1) continue;
+
+                        // check neighbors
+                        changed = changed || ClassicalProcGen.wfcEliminate(grid, x, y, rules);
+                    }
+                }
+            }
+        }
+
+        // main solving loop
+        for (;;) {
+            const cell = lowestEntropyCell();
+            if (!cell) break;
+            observe(cell.x, cell.y);
+            propagate();
+        }
+
+        // collapse final sets to a single tile
+        const collapsed = grid.map(row => row.map(set => [...set][0] || "?"));
+        return collapsed;
+    }
+
+
+    static wfcEliminate(grid, x, y, rules) {
+        const allowed = new Set();
+
+        // gather union of allowed states based on neighbors
+        const directions = [
+            { dx:0, dy:-1, type:"N" },
+            { dx:1, dy:0, type:"E" },
+            { dx:0, dy:1, type:"S" },
+            { dx:-1, dy:0, type:"W" }
+        ];
+
+        grid[y][x].forEach(tile => allowed.add(tile));
+
+        for (const {dx,dy,type} of directions) {
+            const nx = x + dx, ny = y + dy;
+            if (grid[ny] && grid[ny][nx]) {
+                const neighborStates = grid[ny][nx];
+                const allowedByRule = new Set();
+
+                neighborStates.forEach(nei => {
+                    if (rules[nei] && rules[nei][type]) {
+                        rules[nei][type].forEach(t => allowedByRule.add(t));
+                    }
+                });
+
+                allowed.forEach(a => {
+                    if (!allowedByRule.has(a)) allowed.delete(a);
+                });
+            }
+        }
+
+        const before = grid[y][x].size;
+        grid[y][x] = allowed;
+        return allowed.size < before;
+    }
+
+    static buildWFCRules(sample) {
+        const rules = {};
+
+        const H = sample.length;
+        const W = sample[0].length;
+
+        function safeAdd(a, dir, b) {
+            if (!rules[a]) rules[a] = { N:new Set(), E:new Set(), S:new Set(), W:new Set() };
+            rules[a][dir].add(b);
+        }
+
+        for (let y = 0; y < H; y++) {
+            for (let x = 0; x < W; x++) {
+                const t = sample[y][x];
+                if (y > 0)     safeAdd(sample[y-1][x], "S", t);
+                if (y < H-1)   safeAdd(sample[y+1][x], "N", t);
+                if (x > 0)     safeAdd(sample[y][x-1], "E", t);
+                if (x < W-1)   safeAdd(sample[y][x+1], "W", t);
+            }
+        }
+        return rules;
+    }
+}
+
+
+class Gadget {
+  /**
+   * Create a modular gadget (tool/weapon/spell)
+   * -------------------------------------------
+   * @param {Object} config
+   * @param {string} config.id
+   * @param {string} config.name
+   * @param {string} config.emoji
+   * @param {string} [config.description]
+   * @param {number} [config.cooldown=1000]
+   * @param {number} [config.energyCost=0]
+   * @param {string[]} [config.tags]
+   * @param {Object<string, Function>} [config.scripts]
+   * @param {Object<string, Function>} [config.effectDefs] - reusable named effects
+   * @param {string[]} [config.effectChain] - ordered list of effect names to execute
+   */
+  constructor(config = {}) {
+    // Core identity
+    this.id = config.id || `gadget_${Math.random().toString(36).slice(2, 9)}`;
+    this.name = config.name || "Unnamed Gadget";
+    this.emoji = config.emoji || "🧰";
+    this.description = config.description || "";
+
+    // Stats
+    this.cooldown = config.cooldown ?? 1000;
+    this.energyCost = config.energyCost ?? 0;
+    this.tags = config.tags || [];
+
+    // Hooks
+    this.scripts = config.scripts || {};
+    this.lastUsed = 0;
+    this.coolingDown = false;
+
+    // Internal effect system
+    this.effectDefs = config.effectDefs || {};
+    this.effectChain = config.effectChain || [];
+  }
+
+  // ===== Basic lifecycle =====
+  canUse(player) {
+    const enoughEnergy = player.energy === undefined || player.energy >= this.energyCost;
+    return !this.coolingDown && enoughEnergy;
+  }
+
+  use(player, room) {
+    if (!this.canUse(player)) {
+      showMessage(this.coolingDown ? "Cooling down..." : "Not enough energy!");
+      return false;
+    }
+
+    this.lastUsed = Date.now();
+    this.coolingDown = true;
+    if (player.energy !== undefined) player.energy -= this.energyCost;
+
+    Log.log({ type: "gadget_used", gadget: this.name });
+    if (this.scripts.onUse) this.scripts.onUse(player, room, this);
+
+    // Run the configured chain of effects
+    this.runEffectChain(player, room);
+
+    // Cooldown reset
+    setTimeout(() => {
+      this.coolingDown = false;
+      if (this.scripts.onCooldownEnd) this.scripts.onCooldownEnd(player, room, this);
+    }, this.cooldown);
+
+    render();
+    return true;
+  }
+
+  hit(target, player, room) {
+    if (this.scripts.onHit) this.scripts.onHit(target, player, room, this);
+    Log.log({ type: "gadget_hit", target: target?.name ?? "unknown", gadget: this.name });
+  }
+
+  equip(player) {
+    if (this.scripts.onEquip) this.scripts.onEquip(player, this);
+  }
+
+  // ===== Effect system =====
+  registerEffect(name, fn) {
+    this.effectDefs[name] = fn;
+  }
+
+  removeEffect(name) {
+    delete this.effectDefs[name];
+  }
+
+  addToChain(name) {
+    if (this.effectDefs[name]) this.effectChain.push(name);
+  }
+
+  clearChain() {
+    this.effectChain = [];
+  }
+
+  async runEffectChain(player, room) {
+    for (const effectName of this.effectChain) {
+      const effect = this.effectDefs[effectName];
+      if (effect) {
+        try {
+          await effect(player, room, this);
+        } catch (err) {
+          console.error(`Effect ${effectName} failed:`, err);
+        }
+      }
+    }
+  }
+  
+// Add this inside the Gadget class
+applyMagicEffect(target, effectConfig) {
+  const eff = new MagicEffect(effectConfig);
+  eff.applyTo(target);
+  if (!target.activeEffects) target.activeEffects = [];
+  if (!effectConfig.stackable) {
+    target.activeEffects = target.activeEffects.filter(e => e.name !== eff.name);
+  }
+  target.activeEffects.push(eff);
+}
+
+ 
+
+  // Serialization for save/load
+  toJSON() {
+    return {
+      id: this.id,
+      name: this.name,
+      emoji: this.emoji,
+      description: this.description,
+      cooldown: this.cooldown,
+      energyCost: this.energyCost,
+      tags: this.tags,
+      chain: this.effectChain.slice()
+    };
+  }
+}
+
+class MagicEffect {
+  /**
+   * @param {Object} config
+   * @param {string} config.id - Unique ID
+   * @param {string} config.name - Name ("Frozen", "Shield", "Regeneration")
+   * @param {string} [config.emoji] - Visual marker
+   * @param {number} [config.duration=3000] - Duration in ms
+   * @param {number} [config.interval=500] - Tick interval in ms
+   * @param {number} [config.power=1] - Intensity of effect
+   * @param {Function} [config.onApply]
+   * @param {Function} [config.onTick]
+   * @param {Function} [config.onExpire]
+   * @param {boolean} [config.stackable=false] - Whether multiple copies can stack
+   */
+  constructor(config = {}) {
+    this.id = config.id || `effect_${Math.random().toString(36).slice(2, 9)}`;
+    this.name = config.name || "Unnamed Effect";
+    this.emoji = config.emoji || "✨";
+    this.duration = config.duration ?? 3000;
+    this.interval = config.interval ?? 500;
+    this.power = config.power ?? 1;
+    this.stackable = config.stackable ?? false;
+
+    this.onApply = config.onApply || (() => {});
+    this.onTick = config.onTick || (() => {});
+    this.onExpire = config.onExpire || (() => {});
+
+    this._remaining = this.duration;
+    this._timer = null;
+    this._target = null;
+  }
+
+  applyTo(target) {
+    this._target = target;
+    this.onApply(target, this);
+    showEffectEmoji(this.emoji, target.x, target.y);
+    Log.log({ type: "effect_applied", effect: this.name, target: target.name || "unknown" });
+    this.startTicking();
+  }
+
+  startTicking() {
+    const tick = () => {
+      if (this._remaining <= 0) {
+        this.expire();
+        return;
+      }
+      this.onTick(this._target, this);
+      this._remaining -= this.interval;
+      this._timer = setTimeout(tick, this.interval);
+    };
+    tick();
+  }
+
+  expire() {
+    clearTimeout(this._timer);
+    this.onExpire(this._target, this);
+    Log.log({ type: "effect_expired", effect: this.name, target: this._target.name || "unknown" });
+    showMessage(`${this.name} effect ended.`);
+  }
+}
+
+class MerchantStore {
+  /**
+   * @param {Object} config
+   * @param {string} config.name - Store name ("Armory", "Potion Hut")
+   * @param {string} [config.emoji] - Display emoji
+   * @param {Array<Object>} [config.items] - Array of item objects {id, name, emoji, price, stock, description}
+   * @param {Function} [config.priceModifier] - Function(player,item) => new price
+   * @param {Function} [config.onBuy] - Hook when an item is bought
+   * @param {Function} [config.onSell] - Hook when an item is sold
+   * @param {Function} [config.onRestock] - Hook when restocking
+   * @param {number} [config.restockInterval] - Time in ms to auto-restock
+   */
+  constructor(config = {}) {
+    this.name = config.name || "Merchant";
+    this.emoji = config.emoji || "🏪";
+    this.items = config.items || [];
+    this.priceModifier = config.priceModifier || ((player, item) => item.price);
+    this.onBuy = config.onBuy || (() => {});
+    this.onSell = config.onSell || (() => {});
+    this.onRestock = config.onRestock || (() => {});
+    this.restockInterval = config.restockInterval || null;
+
+    if (this.restockInterval) {
+      setInterval(() => this.restock(), this.restockInterval);
+    }
+  }
+
+  listInventory() {
+    return this.items
+      .map(i => `${i.emoji || "🛒"} ${i.name} — ${i.price}💰 (x${i.stock})`)
+      .join("\n");
+  }
+
+  restock() {
+    for (const item of this.items) {
+      const refill = Math.floor(Math.random() * 3);
+      item.stock += refill;
+    }
+    this.onRestock(this);
+    Log.log({ type: "merchant_restock", store: this.name });
+  }
+
+  findItemByName(name) {
+    return this.items.find(i => i.name.toLowerCase() === name.toLowerCase());
+  }
+
+  buy(player, itemName) {
+    const item = this.findItemByName(itemName);
+    if (!item || item.stock <= 0) {
+      showMessage(`${this.name}: Sorry, we're out of that.`);
+      return false;
+    }
+
+    const price = this.priceModifier(player, item);
+    if (player.gold < price) {
+      showMessage(`${this.name}: You can't afford that!`);
+      return false;
+    }
+
+    player.gold -= price;
+    player.inventory.push({ ...item });
+    item.stock--;
+    showMessage(`${this.name}: Pleasure doing business!`);
+    this.onBuy(player, item, this);
+    Log.log({ type: "merchant_sale", store: this.name, item: item.name, price });
+    return true;
+  }
+
+  sell(player, itemName) {
+    const idx = player.inventory.findIndex(i => i.name.toLowerCase() === itemName.toLowerCase());
+    if (idx === -1) {
+      showMessage(`${this.name}: You don't have that item.`);
+      return false;
+    }
+
+    const item = player.inventory[idx];
+    const sellPrice = Math.floor(item.price / 2);
+    player.inventory.splice(idx, 1);
+    player.gold += sellPrice;
+
+    showMessage(`${this.name}: I’ll give you ${sellPrice}💰 for it.`);
+    this.onSell(player, item, this);
+    Log.log({ type: "merchant_buyback", store: this.name, item: item.name, price: sellPrice });
+    return true;
+  }
+}
+
+		     
+// === Start ===
+setInterval(updateEnemies, 120); // ~8 moves / sec.
+updateQuestHUD();
+
+loadRoom('local://start');
+</script>
+</body>
+</html>
+
